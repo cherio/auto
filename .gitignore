@@ -1,5 +1,12 @@
+!**/.gitignore
 **/.*
 **/.*/
 **/*~*
 **/*~*/
-!**/.gitignore
+/.build/
+_build/
+/*.gz
+/Makefile
+/Makefile.old
+/MANIFEST.bak
+/*.zip
