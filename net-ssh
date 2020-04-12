@@ -1,0 +1,151 @@
+#!/usr/bin/perl
+#
+#	Join a remote LAN via SSH
+#	requirements (both client & server): perl, iproute2, iptables; root access
+#	run as "root"
+#
+
+use strict;
+use warnings;
+use Getopt::Long qw/:config no_ignore_case bundling/;
+
+$0 = join(' ', ($0 =~ s{^.*?([^/]+)$}{$1}sr), @ARGV);
+
+Getopt::Long::GetOptions(
+	'server|s:s' => \(my $ssh_server), # --server=[user@]host[:port] # remote SSH gate-in server; default usr=root, default port=22
+	'ssh:s@' => \(my $ssh_args), # extra arguments passed to "ssh"
+	'tun-spec|t:s' => \(my $tun_spec = "1:1"), # e.g. --tun-spec=1:2 see 'man ssh' option -w
+	'tun-addr|T:s' => \(my $tun_addr = '10.190.190.250:251'), # tunnel ip address(es) (peer address is optional) e.g. --tun-addr=10.0.0.7[:10.0.0.8]
+	'net-remote|net||N=s@' => \(my $nets_remote), # remote network(s) you want to VPN into, --net-remote=172.30.208.0/20 --net-remote=172.31.111.0/24
+	'dry-run|dry' => \(my $dry_run), # don't execute local commands, just show them
+	'help' => \(my $help) # read comments for the options above
+);
+
+STDOUT->autoflush(1);
+STDERR->autoflush(1);
+
+die("See source header for help") if $help;
+die("Please specify at least one remote network to join") if !$nets_remote;
+my $invalid_nets = join(', ', grep { !m{^(?:\d+\.){3}\d+/\d+$}s } @$nets_remote);
+die("Invalid remote network spec(s): $invalid_nets") if $invalid_nets;
+
+($ssh_server =~ m{^ (?:(\w+)\@)? ( \w[\w\-]+ | \d{1,3}(?:\.\d{1,3}){3} | \[[\w\:]+\] ) (?:\:(\d+))? $}sx) or die("Bad server spec");
+my ($ssh_user, $ssh_host, $ssh_port) = ($1 // 'root', $2, $3);
+my ($dev_tun_lo, $dev_tun_re) = ($tun_spec =~ m{^(\d+) \: (\d+)$}sx) ? ('tun'.$1, 'tun'.$2) : die("Bad tunnel sequence spec");
+
+my ($addr_tun_lo, $tun_pfx, $tun_sfx_lo, $tun_sfx_re, $addr_tun_re) =
+	($tun_addr =~ m{^(((?:\d+\.){3}) (\d+)) (?:[,:] (?: (\d+) | ((?:\d+\.){3} \d+) ))? $}x) or die("Invalid '--tun-addr' spec");
+$addr_tun_re //= $addr_tun_re // defined($tun_sfx_re) ? $tun_pfx.$tun_sfx_re : $tun_pfx.($tun_sfx_lo + 1);
+
+die("Run me as root") if ($ENV{USER} // $ENV{LOGNAME} // qx{whoami}) !~ /^root$/m;
+
+my $cmd_params = {
+	dev_tun_lo => $dev_tun_lo,
+	dev_tun_re => $dev_tun_re,
+	addr_tun_lo => $addr_tun_lo,
+	addr_tun_re => $addr_tun_re,
+	nets_remote => join(',', @$nets_remote)
+};
+
+# local cleanup
+my $local_cleanup_cmd = <<'EOF' =~ s{^\h*\#\V*\n}{}gmr =~ s{^\h+}{}gmr =~ s{ (\$\{ (\w+) \}) }{ $cmd_params->{$2} // $1 }gexr;
+	/sbin/ip route | perl -ne 'm{^(\S+)(?=\h) .*? \h+ dev \h+ \Q${dev_tun_lo}\E}x and system("/sbin/ip route del $1")'
+EOF
+print("Local cleanup:\n$local_cleanup_cmd\n");
+system($local_cleanup_cmd) if !$dry_run;
+
+# initialize local routing
+my $local_init_cmd = <<"EOF";
+	/sbin/ip link set $dev_tun_lo up
+	/sbin/ip addr add $addr_tun_lo peer $addr_tun_re/32 dev $dev_tun_lo
+EOF
+for my $rnet (@$nets_remote) {
+	$local_init_cmd .= "/sbin/ip route add $rnet via $addr_tun_lo" . "\n";
+}
+$local_init_cmd = $local_init_cmd =~ s{\t+}{}gsr =~ s{\n+}{; }gsr =~ s{^\h*\#\V*\n}{}gmr =~ s{\s*;*\s*$}{}sr;
+
+# remote perl code to execute on the server upon connection
+my $remote_cmd = <<'REMOTE_CODE' =~ s{ (\$\{ (\w+) \}) }{ $cmd_params->{$2} // $1 }gexr =~ s{^\h*\#\V*\n}{}gmr;
+use strict;
+use warnings;
+STDOUT->autoflush(1);
+STDERR->autoflush(1);
+
+my $ip_route = qx{/sbin/ip route};
+my $ifaces_re_map = {};
+my $net_addr_re_map = {};
+for my $net_re (split(/,/, '${nets_remote}')) {
+	my ($iface, $iface_addr_re) = ($ip_route =~ m{^\h* \Q$net_re\E \h+ dev \h+ (\S+) \V+? \h+ src \h+ ([\d\.]+) \h*}mx)
+		or die("Failed to detect remote network interface for '$net_re'");
+	$ifaces_re_map->{$iface} = 1;
+	$net_addr_re_map->{$net_re} = $iface_addr_re;
+}
+
+my $rule_tag = "-m comment --comment ${dev_tun_re}".'x'.$$;
+
+my $init_net_cmd = <<'SRV_INIT' =~ s{^\h+}{}gmr; # init network, shell script
+	# prepare / cleanup resources
+	/sbin/iptables -t filter -S | perl -ne 'm{^-A (.*? -[oi] \Q${dev_tun_re}\E .*)} and system("/sbin/iptables -t filter -D $1")'
+	/sbin/iptables -t nat -S | perl -ne 'm{^-A (.*?\Q -s ${addr_tun_lo}/\E\d+.*)} and system("/sbin/iptables -t nat -D $1")'
+	echo 1 > /proc/sys/net/ipv4/ip_forward
+	# prepare/setup device & IP
+	/sbin/ip link set ${dev_tun_re} up
+	/sbin/ip addr add ${addr_tun_re} peer ${addr_tun_lo}/32 dev ${dev_tun_re}
+SRV_INIT
+for my $riface (keys %$ifaces_re_map) { # allow 2-way traffic between interfaces tunX and enoYY
+	$init_net_cmd .= "/sbin/iptables -t filter -I FORWARD 1 -i $riface -o ${dev_tun_re} $rule_tag -m state --state ESTABLISHED,RELATED -j ACCEPT" . "\n";
+	$init_net_cmd .= "/sbin/iptables -t filter -I FORWARD 2 -i ${dev_tun_re} -o $riface $rule_tag -j ACCEPT" . "\n";
+}
+while (my ($net_re, $iface_addr_re) = each (%$net_addr_re_map)) { # mask incoming client IP with local
+	$init_net_cmd .= "/sbin/iptables -t nat -A POSTROUTING -s ${addr_tun_lo}/32 -d $net_re $rule_tag -j SNAT --to-source $iface_addr_re" . "\n";
+}
+
+print("Server init:\n$init_net_cmd\n");
+system($init_net_cmd);
+
+my $srv_cleanup_cmd = <<'SRV_CLR' =~ s{^\h+}{}gmr =~ s{(\$(\w+))\b}{{RULE_TAG=>$rule_tag}->{$2}//$1}ger; # cleanup after
+	/sbin/iptables -t filter -S | perl -ne 'm{^-A (.*?\Q $RULE_TAG \E.*)} and system("/sbin/iptables -t filter -D $1")'
+	/sbin/iptables -t nat -S | perl -ne 'm{^-A (.*?\Q $RULE_TAG \E.*)} and system("/sbin/iptables -t nat -D $1")'
+SRV_CLR
+print("This will run on terminate:\n$srv_cleanup_cmd");
+
+my $sshd_pid = getppid();
+my $finalizer_cmdz = <<'FINALIZER' =~ s{^\h+}{}gmr =~ s{(\$(\w+))\b}{{SSHD_PID=>$sshd_pid,CLEAN_CMDZ=>$srv_cleanup_cmd}->{$2}//$1}ger;
+	$0 = "net-ssh finalizer ${dev_tun_re}-$SSHD_PID"; # change process title
+	my $sshd_stat_file = "/proc/$SSHD_PID/cmdline"; # SSHD process file
+	my $sshd_ctime = (-C $sshd_stat_file).''; # inode change timestamp
+	sleep(1) while $sshd_ctime eq -C $sshd_stat_file; # in memory '/proc' file stat is cheap & fast
+	exec(<<'CLEAN');
+	$CLEAN_CMDZ
+	CLEAN
+FINALIZER
+
+# install/launch finalizer
+exec("( (
+/usr/bin/perl <<'FINALIZER'
+$finalizer_cmdz
+FINALIZER
+)& )&");
+REMOTE_CODE
+print("To be run on the server:\n$remote_cmd\n") if $dry_run;
+
+$SIG{'INT'} = $SIG{'TERM'} = $SIG{'HUP'} = \&net_cleanup; # handle dying gracefully
+
+# all the "VPN" action is here
+my @ssh_extra = $ssh_args ? @$ssh_args : ();
+push(@ssh_extra, '-p', $ssh_port) if $ssh_port;
+my @ssh_cmd = ('ssh', '-o', 'PermitLocalCommand yes', '-o', "LocalCommand $local_init_cmd", '-w', $tun_spec, @ssh_extra, "$ssh_user\@$ssh_host", '--', '/usr/bin/perl');
+print("SSH cmd:\n".join(' ', @ssh_cmd)."\n\n");
+if (!$dry_run) {
+	open(my $remote_hcmd, '|-', @ssh_cmd);
+	print $remote_hcmd $remote_cmd; # send perl code to be executed on the remote server
+	print("Remote initialization commands sent\n");
+	close($remote_hcmd); # this will stop and wait until connection terminates
+	print("SSH disconnected\n");
+}
+net_cleanup();
+
+sub net_cleanup {
+	print("Client cleanup:\n$local_cleanup_cmd");
+	exec($local_cleanup_cmd) if !$dry_run;
+}
