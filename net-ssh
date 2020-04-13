@@ -40,11 +40,11 @@ $addr_tun_re //= $addr_tun_re // defined($tun_sfx_re) ? $tun_pfx.$tun_sfx_re : $
 die("Run me as root") if ($ENV{USER} // $ENV{LOGNAME} // qx{whoami}) !~ /^root$/m;
 
 my $cmd_params = {
-	dev_tun_lo => $dev_tun_lo,
-	dev_tun_re => $dev_tun_re,
-	addr_tun_lo => $addr_tun_lo,
-	addr_tun_re => $addr_tun_re,
-	nets_remote => join(',', @$nets_remote)
+	dev_tun_lo => $dev_tun_lo, # tunnel interface on the client, e.g. "tun1"
+	dev_tun_re => $dev_tun_re, # tunnel interface on the remote server, e.g. "tun1"
+	addr_tun_lo => $addr_tun_lo, # client tunnel interface IP
+	addr_tun_re => $addr_tun_re, # remote tunnel interface IP; +1 if not specified
+	nets_remote => join(',', @$nets_remote) # remote LAN[s] to join
 };
 
 # local cleanup
@@ -59,7 +59,7 @@ my $local_init_cmd = <<"EOF";
 	/sbin/ip link set $dev_tun_lo up
 	/sbin/ip addr add $addr_tun_lo peer $addr_tun_re/32 dev $dev_tun_lo
 EOF
-for my $rnet (@$nets_remote) {
+for my $rnet (@$nets_remote) { # route packets to the remote LAN[s] on the client via the new tunnel interface
 	$local_init_cmd .= "/sbin/ip route add $rnet via $addr_tun_lo" . "\n";
 }
 $local_init_cmd = $local_init_cmd =~ s{\t+}{}gsr =~ s{\n+}{; }gsr =~ s{^\h*\#\V*\n}{}gmr =~ s{\s*;*\s*$}{}sr;
@@ -81,21 +81,23 @@ for my $net_re (split(/,/, '${nets_remote}')) {
 	$net_addr_re_map->{$net_re} = $iface_addr_re;
 }
 
-my $rule_tag = "-m comment --comment ${dev_tun_re}".'x'.$$;
+my $rule_tag = "-m comment --comment ${dev_tun_re}".'x'.$$; # tag created iptables rules; it helps with purging them at the end
 
 my $init_net_cmd = <<'SRV_INIT' =~ s{^\h+}{}gmr; # init network, shell script
-	# prepare / cleanup resources
+	# prepare / cleanup tunnel resources we need for this connection to work; likely redundant
 	/sbin/iptables -t filter -S | perl -ne 'm{^-A (.*? -[oi] \Q${dev_tun_re}\E .*)} and system("/sbin/iptables -t filter -D $1")'
 	/sbin/iptables -t nat -S | perl -ne 'm{^-A (.*?\Q -s ${addr_tun_lo}/\E\d+.*)} and system("/sbin/iptables -t nat -D $1")'
 	echo 1 > /proc/sys/net/ipv4/ip_forward
-	# prepare/setup device & IP
+	# prepare/setup tunnel device & IP
 	/sbin/ip link set ${dev_tun_re} up
 	/sbin/ip addr add ${addr_tun_re} peer ${addr_tun_lo}/32 dev ${dev_tun_re}
 SRV_INIT
+# the following FORWARDs are only necessary when the default filter FORWARD policy is DROP
 for my $riface (keys %$ifaces_re_map) { # allow 2-way traffic between interfaces tunX and enoYY
 	$init_net_cmd .= "/sbin/iptables -t filter -I FORWARD 1 -i $riface -o ${dev_tun_re} $rule_tag -m state --state ESTABLISHED,RELATED -j ACCEPT" . "\n";
 	$init_net_cmd .= "/sbin/iptables -t filter -I FORWARD 2 -i ${dev_tun_re} -o $riface $rule_tag -j ACCEPT" . "\n";
 }
+# MASQUERADE client packets, use local server LAN IP address
 while (my ($net_re, $iface_addr_re) = each (%$net_addr_re_map)) { # mask incoming client IP with local
 	$init_net_cmd .= "/sbin/iptables -t nat -A POSTROUTING -s ${addr_tun_lo}/32 -d $net_re $rule_tag -j SNAT --to-source $iface_addr_re" . "\n";
 }
@@ -103,24 +105,25 @@ while (my ($net_re, $iface_addr_re) = each (%$net_addr_re_map)) { # mask incomin
 print("Server init:\n$init_net_cmd\n");
 system($init_net_cmd);
 
+# commands to cleanup the tagged iptable rules created in this session
 my $srv_cleanup_cmd = <<'SRV_CLR' =~ s{^\h+}{}gmr =~ s{(\$(\w+))\b}{{RULE_TAG=>$rule_tag}->{$2}//$1}ger; # cleanup after
 	/sbin/iptables -t filter -S | perl -ne 'm{^-A (.*?\Q $RULE_TAG \E.*)} and system("/sbin/iptables -t filter -D $1")'
 	/sbin/iptables -t nat -S | perl -ne 'm{^-A (.*?\Q $RULE_TAG \E.*)} and system("/sbin/iptables -t nat -D $1")'
 SRV_CLR
-print("This will run on terminate:\n$srv_cleanup_cmd");
+print("This will run right after SSHD shuts down:\n$srv_cleanup_cmd");
 
-my $sshd_pid = getppid();
+my $sshd_pid = getppid(); # wait for this PID to vanish, then cleanup iptables rule created by this script
 my $finalizer_cmdz = <<'FINALIZER' =~ s{^\h+}{}gmr =~ s{(\$(\w+))\b}{{SSHD_PID=>$sshd_pid,CLEAN_CMDZ=>$srv_cleanup_cmd}->{$2}//$1}ger;
 	$0 = "net-ssh finalizer ${dev_tun_re}-$SSHD_PID"; # change process title
 	my $sshd_stat_file = "/proc/$SSHD_PID/cmdline"; # SSHD process file
 	my $sshd_ctime = (-C $sshd_stat_file).''; # inode change timestamp
-	sleep(1) while $sshd_ctime eq -C $sshd_stat_file; # in memory '/proc' file stat is cheap & fast
-	exec(<<'CLEAN');
+	sleep(1) while $sshd_ctime eq -C $sshd_stat_file; # in memory '/proc' file stat is free (CPU use < 3sec/24hr)
+	exec(<<'CLEANUP_CMDZ');
 	$CLEAN_CMDZ
-	CLEAN
+	CLEANUP_CMDZ
 FINALIZER
 
-# install/launch finalizer
+# install/launch the finalizer as a daemon
 exec("( (
 /usr/bin/perl <<'FINALIZER'
 $finalizer_cmdz
@@ -129,15 +132,14 @@ FINALIZER
 REMOTE_CODE
 print("To be run on the server:\n$remote_cmd\n") if $dry_run;
 
-$SIG{'INT'} = $SIG{'TERM'} = $SIG{'HUP'} = \&net_cleanup; # handle dying gracefully
-
 # all the "VPN" action is here
 my @ssh_extra = $ssh_args ? @$ssh_args : ();
 push(@ssh_extra, '-p', $ssh_port) if $ssh_port;
 my @ssh_cmd = ('ssh', '-o', 'PermitLocalCommand yes', '-o', "LocalCommand $local_init_cmd", '-w', $tun_spec, @ssh_extra, "$ssh_user\@$ssh_host", '--', '/usr/bin/perl');
 print("SSH cmd:\n".join(' ', @ssh_cmd)."\n\n");
 if (!$dry_run) {
-	open(my $remote_hcmd, '|-', @ssh_cmd);
+	$SIG{'INT'} = $SIG{'TERM'} = $SIG{'HUP'} = \&net_cleanup; # handle dying gracefully
+	open(my $remote_hcmd, '|-', @ssh_cmd); # run ssh
 	print $remote_hcmd $remote_cmd; # send perl code to be executed on the remote server
 	print("Remote initialization commands sent\n");
 	close($remote_hcmd); # this will stop and wait until connection terminates

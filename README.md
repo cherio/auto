@@ -12,9 +12,12 @@ to tun5, configure routing on the client and iptables on the sever in order to a
 network 10.1.1.0/24 from the client machine.
 
 I wrote it as a replacement for sshuttle. I love sshuttle! It is better than my script in many ways.
-Except for speed. This way to join a remote network is 2-5 times faster, depending on the bandwidth between
-client and server. sshuttle performs its own packet routing. It doesn't require connection as root.
+Except for speed. My script delegates packet forwarding to iptables which is 2-5 times faster (in my personal
+experience), depending on the actual bandwidth between client and server. sshuttle doesn't require connecting
+as root. It performs it's own packet forwarding/routing.
 
-I suggest only use my script and not sshuttle if:
+I suggest use my script and not sshuttle only if:
 1) you can ssh as root and
-2) you need better communication speed
+2) you need a faster channel
+
+Otherwise I recommend using sshuttle.
