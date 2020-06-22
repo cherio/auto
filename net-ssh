@@ -1,8 +1,10 @@
 #!/usr/bin/perl
 #
-#	Join a remote LAN via SSH
-#	requirements (both client & server): perl, iproute2, iptables; root access
-#	run as "root"
+# Join a remote LAN via SSH
+# requirements (both client & server): perl, iproute2, iptables; root access
+# run as "root". Ensure server is configured with "PermitTunnel yes".
+# https://help.ubuntu.com/community/SSH_VPN/
+# https://grox.net/sysadm/net/ssh.vpn.tun.howto
 #
 
 use strict;
@@ -13,16 +15,19 @@ $0 = join(' ', ($0 =~ s{^.*?([^/]+)$}{$1}sr), @ARGV);
 
 Getopt::Long::GetOptions(
 	'server|s:s' => \(my $ssh_server), # --server=[user@]host[:port] # remote SSH gate-in server; default usr=root, default port=22
-	'ssh:s@' => \(my $ssh_args), # extra arguments passed to "ssh"
 	'tun-spec|t:s' => \(my $tun_spec = "1:1"), # e.g. --tun-spec=1:2 see 'man ssh' option -w
 	'tun-addr|T:s' => \(my $tun_addr = '10.190.190.250:251'), # tunnel ip address(es) (peer address is optional) e.g. --tun-addr=10.0.0.7[:10.0.0.8]
-	'net-remote|net||N=s@' => \(my $nets_remote), # remote network(s) you want to VPN into, --net-remote=172.30.208.0/20 --net-remote=172.31.111.0/24
+	'net-remote|net|N=s@' => \(my $nets_remote), # remote network(s) you want to VPN into, --net-remote=172.30.208.0/20 --net-remote=172.31.111.0/24
 	'dry-run|dry' => \(my $dry_run), # don't execute local commands, just show them
 	'help' => \(my $help) # read comments for the options above
+	# the unrecognized options and everything after '--' will be passed as options to "ssh"
 );
 
 STDOUT->autoflush(1);
 STDERR->autoflush(1);
+
+my @ssh_extra = (@ARGV); # the remainder & the unknown arguments - just pass to ssh
+shift @ssh_extra if scalar(@ssh_extra) && $ssh_extra[0] eq '--';
 
 die("See source header for help") if $help;
 die("Please specify at least one remote network to join") if !$nets_remote;
@@ -60,7 +65,7 @@ my $local_init_cmd = <<"EOF";
 	/sbin/ip addr add $addr_tun_lo peer $addr_tun_re/32 dev $dev_tun_lo
 EOF
 for my $rnet (@$nets_remote) { # route packets to the remote LAN[s] on the client via the new tunnel interface
-	$local_init_cmd .= "/sbin/ip route add $rnet via $addr_tun_lo" . "\n";
+	$local_init_cmd .= "/sbin/ip route add $rnet metric 1000 via $addr_tun_lo" . "\n";
 }
 $local_init_cmd = $local_init_cmd =~ s{\t+}{}gsr =~ s{\n+}{; }gsr =~ s{^\h*\#\V*\n}{}gmr =~ s{\s*;*\s*$}{}sr;
 
@@ -71,22 +76,28 @@ use warnings;
 STDOUT->autoflush(1);
 STDERR->autoflush(1);
 
-my $ip_route = qx{/sbin/ip route};
+$ENV{PATH} .= ':/usr/sbin' if $ENV{PATH} !~ m{(?:^|:)/usr/sbin(?:$|:)}m && -d '/usr/sbin';
+$ENV{PATH} .= ':/sbin' if $ENV{PATH} !~ m{(?:^|:)/sbin(?:$|:)}m && -d '/sbin';
+
+my $ip_route = qx{/sbin/ip route; /sbin/ip a};
 my $ifaces_re_map = {};
 my $net_addr_re_map = {};
 for my $net_re (split(/,/, '${nets_remote}')) {
-	my ($iface, $iface_addr_re) = ($ip_route =~ m{^\h* \Q$net_re\E \h+ dev \h+ (\S+) \V+? \h+ src \h+ ([\d\.]+) \h*}mx)
+	my ($iface, $iface_addr_re) = ($ip_route =~ m{^\h* \Q$net_re\E \h+ dev \h+ (\S+) \V+? \h+ src \h+ ([\d\.]+) }mx)
 		or die("Failed to detect remote network interface for '$net_re'");
 	$ifaces_re_map->{$iface} = 1;
 	$net_addr_re_map->{$net_re} = $iface_addr_re;
 }
 
+die("Missing server tunnel interface: ${dev_tun_re}; ensure 'PermitTunnel yes'") if $ip_route !~ m{^ \h*\d+: \h+ \Q${dev_tun_re}\E: \h }mx;
+die("Failed to detect server configuration") if scalar(%$ifaces_re_map) == 0;
+
 my $rule_tag = "-m comment --comment ${dev_tun_re}".'x'.$$; # tag created iptables rules; it helps with purging them at the end
 
 my $init_net_cmd = <<'SRV_INIT' =~ s{^\h+}{}gmr; # init network, shell script
 	# prepare / cleanup tunnel resources we need for this connection to work; likely redundant
-	/sbin/iptables -t filter -S | perl -ne 'm{^-A (.*? -[oi] \Q${dev_tun_re}\E .*)} and system("/sbin/iptables -t filter -D $1")'
-	/sbin/iptables -t nat -S | perl -ne 'm{^-A (.*?\Q -s ${addr_tun_lo}/\E\d+.*)} and system("/sbin/iptables -t nat -D $1")'
+	iptables -t filter -S | perl -ne 'm{^-A (.*? -[oi] \Q${dev_tun_re}\E .*)} and system("iptables -t filter -D $1")'
+	iptables -t nat -S | perl -ne 'm{^-A (.*?\Q -s ${addr_tun_lo}/\E\d+.*)} and system("iptables -t nat -D $1")'
 	echo 1 > /proc/sys/net/ipv4/ip_forward
 	# prepare/setup tunnel device & IP
 	/sbin/ip link set ${dev_tun_re} up
@@ -94,12 +105,12 @@ my $init_net_cmd = <<'SRV_INIT' =~ s{^\h+}{}gmr; # init network, shell script
 SRV_INIT
 # the following FORWARDs are only necessary when the default filter FORWARD policy is DROP
 for my $riface (keys %$ifaces_re_map) { # allow 2-way traffic between interfaces tunX and enoYY
-	$init_net_cmd .= "/sbin/iptables -t filter -I FORWARD 1 -i $riface -o ${dev_tun_re} $rule_tag -m state --state ESTABLISHED,RELATED -j ACCEPT" . "\n";
-	$init_net_cmd .= "/sbin/iptables -t filter -I FORWARD 2 -i ${dev_tun_re} -o $riface $rule_tag -j ACCEPT" . "\n";
+	$init_net_cmd .= "iptables -t filter -I FORWARD 1 -i $riface -o ${dev_tun_re} $rule_tag -m state --state ESTABLISHED,RELATED -j ACCEPT" . "\n";
+	$init_net_cmd .= "iptables -t filter -I FORWARD 2 -i ${dev_tun_re} -o $riface $rule_tag -j ACCEPT" . "\n";
 }
 # MASQUERADE client packets, use local server LAN IP address
 while (my ($net_re, $iface_addr_re) = each (%$net_addr_re_map)) { # mask incoming client IP with local
-	$init_net_cmd .= "/sbin/iptables -t nat -A POSTROUTING -s ${addr_tun_lo}/32 -d $net_re $rule_tag -j SNAT --to-source $iface_addr_re" . "\n";
+	$init_net_cmd .= "iptables -t nat -A POSTROUTING -s ${addr_tun_lo}/32 -d $net_re $rule_tag -j SNAT --to-source $iface_addr_re" . "\n";
 }
 
 print("Server init:\n$init_net_cmd\n");
@@ -107,8 +118,8 @@ system($init_net_cmd);
 
 # commands to cleanup the tagged iptable rules created in this session
 my $srv_cleanup_cmd = <<'SRV_CLR' =~ s{^\h+}{}gmr =~ s{(\$(\w+))\b}{{RULE_TAG=>$rule_tag}->{$2}//$1}ger; # cleanup after
-	/sbin/iptables -t filter -S | perl -ne 'm{^-A (.*?\Q $RULE_TAG \E.*)} and system("/sbin/iptables -t filter -D $1")'
-	/sbin/iptables -t nat -S | perl -ne 'm{^-A (.*?\Q $RULE_TAG \E.*)} and system("/sbin/iptables -t nat -D $1")'
+	iptables -t filter -S | perl -ne 'm{^-A (.*?\Q $RULE_TAG \E.*)} and system("iptables -t filter -D $1")'
+	iptables -t nat -S | perl -ne 'm{^-A (.*?\Q $RULE_TAG \E.*)} and system("iptables -t nat -D $1")'
 SRV_CLR
 print("This will run right after SSHD shuts down:\n$srv_cleanup_cmd");
 
@@ -133,7 +144,6 @@ REMOTE_CODE
 print("To be run on the server:\n$remote_cmd\n") if $dry_run;
 
 # all the "VPN" action is here
-my @ssh_extra = $ssh_args ? @$ssh_args : ();
 push(@ssh_extra, '-p', $ssh_port) if $ssh_port;
 my @ssh_cmd = ('ssh', '-o', 'PermitLocalCommand yes', '-o', "LocalCommand $local_init_cmd", '-w', $tun_spec, @ssh_extra, "$ssh_user\@$ssh_host", '--', '/usr/bin/perl');
 print("SSH cmd:\n".join(' ', @ssh_cmd)."\n\n");
